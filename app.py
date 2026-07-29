@@ -1,64 +1,85 @@
-import sqlite3
 import os
-from pathlib import Path
+import time
 
+import psycopg
 from flask import Flask, jsonify, request
+from psycopg.rows import dict_row
 
 app = Flask(__name__)
 
-DATABASE_PATH = Path(
-    os.environ.get(
-        "DATABASE_PATH",
-        str(Path(__file__).parent / "visits.db"),
-    )
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://visituser:visitpassword@localhost:5432/visitcounter",
 )
 
 
-def get_database_connection() -> sqlite3.Connection:
+def get_database_connection() -> psycopg.Connection:
     """
-    Open a new connection to the SQLite database.
+    Open a new connection to PostgreSQL.
 
-    timeout=10 means SQLite will wait up to 10 seconds if another
-    connection temporarily has the database locked.
+    dict_row makes query results behave like dictionaries, allowing:
+        result["total"]
+    instead of:
+        result[0]
     """
-    connection = sqlite3.connect(DATABASE_PATH, timeout=10)
+    return psycopg.connect(
+        DATABASE_URL,
+        row_factory=dict_row,
+    )
 
-    # Ask SQLite to wait up to 10 seconds when encountering a lock.
-    connection.execute("PRAGMA busy_timeout = 10000")
 
-    return connection
+def wait_for_database(
+    attempts: int = 10,
+    delay_seconds: int = 2,
+) -> None:
+    """
+    Wait for PostgreSQL to become available.
+
+    The PostgreSQL container may need a few seconds to initialize.
+    Flask should not immediately crash simply because the database is
+    still starting.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            with get_database_connection() as connection:
+                connection.execute("SELECT 1")
+
+            print("PostgreSQL is ready.")
+            return
+
+        except psycopg.OperationalError as error:
+            print(
+                f"Database connection attempt "
+                f"{attempt}/{attempts} failed: {error}"
+            )
+
+            if attempt == attempts:
+                raise
+
+            time.sleep(delay_seconds)
 
 
 def initialize_database() -> None:
     """
     Create the visits table if it does not already exist.
     """
-
-    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    connection = get_database_connection()
-
-    try:
+    with get_database_connection() as connection:
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS visits (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id BIGSERIAL PRIMARY KEY,
                 ip_address TEXT NOT NULL,
-                visited_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                visited_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
-
-        connection.commit()
-    finally:
-        connection.close()
 
 
 @app.route("/")
 def home():
     return """
     <h1>Visit Counter</h1>
-    <p>Visits are stored in an SQLite database.</p>
+    <p>Visits are now stored in PostgreSQL.</p>
     <ul>
         <li><a href="/count">Record a visit</a></li>
         <li><a href="/health">Check server health</a></li>
@@ -70,51 +91,39 @@ def home():
 def count():
     visitor_ip = request.remote_addr or "unknown"
 
-    connection = get_database_connection()
-
     try:
-        # Record this visit.
-        connection.execute(
-            """
-            INSERT INTO visits (ip_address)
-            VALUES (?)
-            """,
-            (visitor_ip,),
-        )
+        with get_database_connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO visits (ip_address)
+                VALUES (%s)
+                """,
+                (visitor_ip,),
+            )
 
-        # Save the inserted row permanently.
-        connection.commit()
+            total_result = connection.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM visits
+                """
+            ).fetchone()
 
-        # COUNT always returns one row containing one number.
-        total_result = connection.execute(
-            """
-            SELECT COUNT(*)
-            FROM visits
-            """
-        ).fetchone()
-
-        unique_result = connection.execute(
-            """
-            SELECT COUNT(DISTINCT ip_address)
-            FROM visits
-            """
-        ).fetchone()
-
-        # fetchone() returns a tuple such as (7,).
-        total_visits = total_result[0]
-        unique_ip_count = unique_result[0]
+            unique_result = connection.execute(
+                """
+                SELECT COUNT(DISTINCT ip_address) AS total
+                FROM visits
+                """
+            ).fetchone()
 
         return jsonify(
             {
-                "total_visits": total_visits,
-                "unique_ip_count": unique_ip_count,
+                "total_visits": total_result["total"],
+                "unique_ip_count": unique_result["total"],
                 "your_ip": visitor_ip,
             }
         )
 
-    except sqlite3.Error as error:
-        connection.rollback()
-
+    except psycopg.Error as error:
         print(f"Database error in /count: {error}")
 
         return (
@@ -127,50 +136,42 @@ def count():
             500,
         )
 
-    finally:
-        # This runs whether the request succeeds or fails.
-        connection.close()
-
 
 @app.route("/health")
 def health():
-    connection = None
-
     try:
-        connection = get_database_connection()
-        connection.execute("SELECT 1").fetchone()
+        with get_database_connection() as connection:
+            connection.execute("SELECT 1")
 
         return jsonify(
             {
                 "status": "healthy",
-                "database": "connected",
+                "database": "postgresql",
+                "database_status": "connected",
             }
         )
 
-    except sqlite3.Error as error:
-        print(f"Database error in /health: {error}")
+    except psycopg.Error as error:
+        print(f"Database health-check error: {error}")
 
         return (
             jsonify(
                 {
                     "status": "unhealthy",
-                    "database": "unavailable",
-                    "details": str(error),
+                    "database": "postgresql",
+                    "database_status": "unavailable",
                 }
             ),
             500,
         )
 
-    finally:
-        if connection is not None:
-            connection.close()
-
 
 if __name__ == "__main__":
+    wait_for_database()
     initialize_database()
 
     app.run(
         host="0.0.0.0",
         port=5001,
-        debug=True,
+        debug=False,
     )

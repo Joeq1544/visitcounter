@@ -8,3 +8,4 @@ visits.db-journal
 visits.db-shm
 visits.db-wal
 .DS_Store
+.env
