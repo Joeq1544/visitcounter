@@ -1,0 +1,12 @@
+services:
+  app:
+    build: .
+    ports:
+      - "5001:5001"
+    environment:
+      DATABASE_PATH: /data/visits.db
+    volumes:
+      - visit-data:/data
+
+volumes:
+  visit-data:
